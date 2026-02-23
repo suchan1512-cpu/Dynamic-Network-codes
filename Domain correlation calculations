@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+"""
+
+
+Compute N-domain vs C-domain correlation submatrices from Dynetan (DNAproc),
+average across replicates (Dynetan windows), and generate a bubble plot of
+mean correlations filtered by |corr| >= cutoff.
+
+Outputs:
+- .npy files: mean matrix, SD matrix, per-window submatrices, filtered residue lists
+- High-resolution PDF + PNG bubble plot
+
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Dict, List, Sequence, Tuple
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+from dynetan.proctraj import DNAproc
+
+
+# ============================================================
+# User configuration
+# ============================================================
+
+# Domain definitions (edit)
+N_DOMAIN_RESIDS = list(range(1, 109)) + list(range(319, 361))
+C_DOMAIN_RESIDS = list(range(110, 319))
+
+# System files (edit)
+PSF_FILE = Path("no_waterWT.psf")
+DCD_FILE = Path("no_waterWT.dcd")
+
+# Segment IDs for this system (edit)
+SEGIDS = ["AP1"]
+
+# Dynetan settings (edit)
+NUM_WINDS = 5
+NUM_FRAMES = 200
+STRIDE = 10
+TRANSFER_STEP = 10
+CUTOFF_DIST = 4.5
+CONTACT_PERSISTENCE = 0.75
+NCORES = 4
+
+SOLVENT_NAMES = ["TIP3"]
+USR_NODE_GROUPS = {
+    "TIP3": {"OH2": set("OH2 H1 H2".split())},
+    "UNL": {
+        "Cl": set("Cl C1 C2 C3 C4 C5 C6 C7 N1 C8 N2 O1 C9 C10 C11 C12 C13 C14 O2".split()),
+        "C15": set("C15 C16 C17 N3 C18 C19 C20 N4 C21 03 F1 F2 F3 LP1".split()),
+    },
+}
+
+# Bubble plot settings
+CUTOFF = 0.3
+CMAP = "inferno_r"
+LABEL_PAIRS = False  # True makes dense labels ("Nres-Cres") on each bubble
+
+# Output prefix and figure names
+OUT_PREFIX = "wt_domain_corr"
+OUT_PDF = "bubbleplot_domain_corr_filtered_highres.pdf"
+OUT_PNG = "bubbleplot_domain_corr_filtered_highres.png"
+
+
+# ============================================================
+# Dynetan helpers
+# ============================================================
+
+def build_dnaproc() -> DNAproc:
+    dnap = DNAproc()
+    dnap.setNumWinds(NUM_WINDS)
+    dnap.setNumSampledFrames(NUM_FRAMES)
+    dnap.setCutoffDist(CUTOFF_DIST)
+    dnap.setContactPersistence(CONTACT_PERSISTENCE)
+    dnap.setSolvNames(SOLVENT_NAMES)
+    dnap.setSegIDs(SEGIDS)
+    dnap.setNodeGroups(USR_NODE_GROUPS)
+    dnap.setDistanceMode(mode="all")
+    return dnap
+
+
+def run_dynetan(psf_file: Path, dcd_file: Path) -> DNAproc:
+    dnap = build_dnaproc()
+
+    dnap.loadSystem(str(psf_file), [str(dcd_file)])
+    dnap.getU().transfer_to_memory(verbose=False, step=TRANSFER_STEP)
+
+    dnap.checkSystem()
+    dnap.selectSystem(withSolvent=False)
+    dnap.prepareNetwork()
+    dnap.alignTraj(inMemory=True)
+
+    dnap.findContacts(stride=STRIDE)
+    dnap.filterContacts(notSameRes=True, notConsecutiveRes=False, removeIsolatedNodes=True)
+    dnap.calcCor(ncores=NCORES)
+
+    return dnap
+
+
+def resid_to_index_from_nodes(dnap: DNAproc) -> Dict[int, int]:
+    resid_to_idx: Dict[int, int] = {}
+    for idx, atom in enumerate(dnap.nodesAtmSel.atoms):
+        resid = int(atom.resid)
+        if resid in resid_to_idx:
+            raise ValueError(
+                f"Duplicate resid detected in nodesAtmSel (resid={resid}). "
+                "If resids repeat across chains/segments, use (segid,resid) mapping."
+            )
+        resid_to_idx[resid] = idx
+    return resid_to_idx
+
+
+# ============================================================
+# Domain workflow
+# ============================================================
+
+def compute_domain_submatrices(
+    psf_file: Path,
+    dcd_file: Path,
+    n_resids: Sequence[int],
+    c_resids: Sequence[int],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Returns:
+      mean_corr (N×C),
+      sd_corr (N×C),
+      submatrices (winds×N×C),
+      n_resids_filtered,
+      c_resids_filtered
+    """
+    print(f"Running Dynetan: {psf_file} / {dcd_file}")
+    dnap = run_dynetan(psf_file, dcd_file)
+
+    resid_to_idx = resid_to_index_from_nodes(dnap)
+
+    n_resids_filtered = np.array([r for r in n_resids if r in resid_to_idx], dtype=int)
+    c_resids_filtered = np.array([r for r in c_resids if r in resid_to_idx], dtype=int)
+
+    n_idx = [resid_to_idx[int(r)] for r in n_resids_filtered]
+    c_idx = [resid_to_idx[int(r)] for r in c_resids_filtered]
+
+    submatrices = np.stack([mat[np.ix_(n_idx, c_idx)] for mat in dnap.corrMatAll])  # (winds, N, C)
+    mean_corr = np.nanmean(submatrices, axis=0)
+    sd_corr = np.nanstd(submatrices, axis=0)
+
+    return mean_corr, sd_corr, submatrices, n_resids_filtered, c_resids_filtered
+
+
+def save_domain_outputs(
+    mean_corr: np.ndarray,
+    sd_corr: np.ndarray,
+    submatrices: np.ndarray,
+    n_resids_filtered: np.ndarray,
+    c_resids_filtered: np.ndarray,
+    out_prefix: str,
+) -> Dict[str, Path]:
+    out_avg = Path(f"{out_prefix}_avg_corr_matrix.npy")
+    out_sd = Path(f"{out_prefix}_sd_corr_matrix.npy")
+    out_sub = Path(f"{out_prefix}_submatrices.npy")
+    out_n = Path(f"{out_prefix}_n_resids_filtered.npy")
+    out_c = Path(f"{out_prefix}_c_resids_filtered.npy")
+
+    np.save(out_avg, mean_corr)
+    np.save(out_sd, sd_corr)
+    np.save(out_sub, submatrices)
+    np.save(out_n, n_resids_filtered)
+    np.save(out_c, c_resids_filtered)
+
+    print("Saved:")
+    print(f"  {out_avg}")
+    print(f"  {out_sd}")
+    print(f"  {out_sub}")
+    print(f"  {out_n}")
+    print(f"  {out_c}")
+
+    return {"avg": out_avg, "sd": out_sd, "sub": out_sub, "n": out_n, "c": out_c}
+
+
+def bubble_plot(
+    mean_corr: np.ndarray,
+    sd_corr: np.ndarray,
+    n_resids_filtered: np.ndarray,
+    c_resids_filtered: np.ndarray,
+    cutoff: float,
+    out_pdf: str,
+    out_png: str,
+    cmap: str,
+    label_pairs: bool,
+) -> None:
+    n_len, c_len = mean_corr.shape
+    X, Y = np.meshgrid(np.arange(c_len), np.arange(n_len))
+
+    x = X.ravel()
+    y = Y.ravel()
+    mean_vals = mean_corr.ravel()
+    sd_vals = sd_corr.ravel()  # stored for downstream use; not plotted by default
+
+    mask = np.abs(mean_vals) >= cutoff
+    x = x[mask]
+    y = y[mask]
+    mean_vals = mean_vals[mask]
+    _ = sd_vals[mask]
+
+    plt.rcParams["pdf.fonttype"] = 42
+    plt.rcParams["savefig.dpi"] = 600
+    plt.rcParams["axes.linewidth"] = 0.8
+
+    fig, ax = plt.subplots(figsize=(16, 12))
+    sc = ax.scatter(
+        x, y,
+        s=np.abs(mean_vals) * 1000,
+        c=mean_vals,
+        cmap=cmap,
+        edgecolor="black",
+        linewidth=0.6,
+        alpha=0.85,
+    )
+
+    if label_pairs:
+        for xi, yi in zip(x, y):
+            ci = int(xi)
+            ni = int(yi)
+            n_res = int(n_resids_filtered[ni])
+            c_res = int(c_resids_filtered[ci])
+            ax.annotate(
+                f"{n_res}-{c_res}",
+                (xi, yi),
+                textcoords="offset points",
+                xytext=(3, 3),
+                fontsize=7,
+                ha="left",
+                va="bottom",
+                clip_on=True,
+                zorder=4,
+            )
+
+    ax.set_xticks(np.arange(0, c_len, 10))
+    ax.set_xticklabels([int(c_resids_filtered[i]) for i in range(0, c_len, 10)], rotation=90, fontsize=9)
+
+    ax.set_yticks(np.arange(0, n_len, 10))
+    ax.set_yticklabels([int(n_resids_filtered[i]) for i in range(0, n_len, 10)], fontsize=9)
+
+    ax.set_xlabel("C Domain Residues", fontsize=14)
+    ax.set_ylabel("N Domain Residues", fontsize=14)
+    ax.set_title(f"N–C Domain Correlation Bubble Plot (|corr| ≥ {cutoff})", fontsize=16, pad=20)
+
+    cbar = plt.colorbar(sc, ax=ax, shrink=0.9)
+    cbar.set_label("Correlation Coefficient", fontsize=12)
+    cbar.ax.tick_params(labelsize=10)
+
+    ax.set_facecolor("white")
+    fig.patch.set_alpha(1.0)
+
+    plt.tight_layout()
+    plt.savefig(out_pdf, dpi=600, bbox_inches="tight", transparent=False)
+    plt.savefig(out_png, dpi=600, bbox_inches="tight", transparent=False)
+    plt.show()
+
+    print(f"Saved: {out_pdf}")
+    print(f"Saved: {out_png}")
+
+
+def main() -> None:
+    if not PSF_FILE.exists() or not DCD_FILE.exists():
+        raise FileNotFoundError(f"Missing input files: {PSF_FILE} / {DCD_FILE}")
+
+    mean_corr, sd_corr, submatrices, n_res_f, c_res_f = compute_domain_submatrices(
+        PSF_FILE, DCD_FILE, N_DOMAIN_RESIDS, C_DOMAIN_RESIDS
+    )
+
+    save_domain_outputs(mean_corr, sd_corr, submatrices, n_res_f, c_res_f, OUT_PREFIX)
+
+    bubble_plot(
+        mean_corr=mean_corr,
+        sd_corr=sd_corr,
+        n_resids_filtered=n_res_f,
+        c_resids_filtered=c_res_f,
+        cutoff=CUTOFF,
+        out_pdf=OUT_PDF,
+        out_png=OUT_PNG,
+        cmap=CMAP,
+        label_pairs=LABEL_PAIRS,
+    )
+
+
+if __name__ == "__main__":
+    main()
