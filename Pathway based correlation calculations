@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+"""
+
+
+Compute per-replicate (per-window) correlation sums along a predefined residue-pair path
+using Dynetan (DNAproc), across multiple variants.
+
+Outputs:
+  1) CSV with per-replicate sums for each variant + a human-readable label column
+  2) Publication-style normalized plot (mean ± SD) grouped by mutant number, comparing
+     ligand-bound vs apo conditions
+  3) Welch t-test + permutation (label-shuffle) p-values vs a chosen reference
+
+
+Edit the VARIANTS list if your filenames differ.
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.stats import ttest_ind
+
+from dynetan.proctraj import DNAproc
+
+
+# =========================
+# Path definition (edit)
+# =========================
+RESIDUE_PAIRS: List[Tuple[int, int]] = [
+    (69, 170),
+    (170, 171),
+    (171, 173),
+    (173, 175),
+    (175, 177),
+    (177, 178),
+    (178, 180),
+    (180, 182),
+    (182, 183),
+    (183, 185),
+    (185, 186),
+    (186, 188),
+    (188, 190),
+    (190, 223),
+    (223, 235),
+    (235, 236),
+]
+
+
+# =========================
+# Dynetan configuration
+# =========================
+SEGIDS = ["XO1", "AP1"]
+SOLVENT_NAMES = ["TIP3"]
+
+USR_NODE_GROUPS = {
+    "TIP3": {"OH2": set("OH2 H1 H2".split())},
+    "UNL": {
+        "Cl": set("Cl C1 C2 C3 C4 C5 C6 C7 N1 C8 N2 O1 C9 C10 C11 C12 C13 C14 O2".split()),
+        "C15": set("C15 C16 C17 N3 C18 C19 C20 N4 C21 03 F1 F2 F3 LP1".split()),
+    },
+}
+
+NUM_WINDS = 5          # You treat these as independent replicates
+NUM_FRAMES = 200
+STRIDE = 10
+TRANSFER_STEP = 10
+CUTOFF_DIST = 4.5
+CONTACT_PERSISTENCE = 0.75
+NCORES = 4
+
+
+# =========================
+# Variant definitions
+# =========================
+@dataclass(frozen=True)
+class Variant:
+    key: str       # internal stable ID used in tables
+    label: str     # user-facing label
+    psf: Path
+    dcd: Path
+    condition: str # "ligand" or "apo"
+    mutant: str    # "WT", "51", "152", ...
+
+
+DATA_DIR = Path(".")  # change if needed
+
+VARIANTS: List[Variant] = [
+    # Apo
+    Variant("APO_WT",   "WT (apo)",          DATA_DIR / "no_waterWT.psf",   DATA_DIR / "no_waterWT.dcd",   "apo",    "WT"),
+    Variant("APO_M51",  "Mut 51 (apo)",      DATA_DIR / "no_water51.psf",   DATA_DIR / "no_water51.dcd",   "apo",    "51"),
+    Variant("APO_M152", "Mut 152 (apo)",     DATA_DIR / "no_water152.psf",  DATA_DIR / "no_water152.dcd",  "apo",    "152"),
+    Variant("APO_M170", "Mut 170 (apo)",     DATA_DIR / "no_water170.psf",  DATA_DIR / "no_water170.dcd",  "apo",    "170"),
+    Variant("APO_M209", "Mut 209 (apo)",     DATA_DIR / "no_water209.psf",  DATA_DIR / "no_water209.dcd",  "apo",    "209"),
+    # Ligand-bound
+    Variant("LIG_WT",   "WT (+ligand)",      DATA_DIR / "no_waterLWT.psf",  DATA_DIR / "no_waterLWT.dcd",  "ligand", "WT"),
+    Variant("LIG_M51",  "Mut 51 (+ligand)",  DATA_DIR / "no_waterL51.psf",  DATA_DIR / "no_waterL51.dcd",  "ligand", "51"),
+    Variant("LIG_M152", "Mut 152 (+ligand)", DATA_DIR / "no_waterL152.psf", DATA_DIR / "no_waterL152.dcd", "ligand", "152"),
+    Variant("LIG_M170", "Mut 170 (+ligand)", DATA_DIR / "no_waterL170.psf", DATA_DIR / "no_waterL170.dcd", "ligand", "170"),
+    Variant("LIG_M209", "Mut 209 (+ligand)", DATA_DIR / "no_waterL209.psf", DATA_DIR / "no_waterL209.dcd", "ligand", "209"),
+]
+
+
+# =========================
+# Stats helper
+# =========================
+def permutation_pval_diff_means(
+    x: Sequence[float],
+    y: Sequence[float],
+    n_iterations: int = 10_000,
+    two_tailed: bool = True,
+    seed: int = 42,
+) -> float:
+    """
+    Permutation (label-shuffle) test for difference in means.
+
+    H0: x and y are exchangeable (same distribution).
+    We shuffle labels to build null distribution of mean difference.
+
+    Note: Valid if samples are independent (you stated they are independent replicates).
+    """
+    rng = np.random.default_rng(seed)
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    observed = np.mean(y) - np.mean(x)
+    combined = np.concatenate([x, y])
+    n_x = len(x)
+
+    diffs = np.empty(n_iterations, dtype=float)
+    for i in range(n_iterations):
+        rng.shuffle(combined)
+        x_star = combined[:n_x]
+        y_star = combined[n_x:]
+        diffs[i] = np.mean(y_star) - np.mean(x_star)
+
+    if two_tailed:
+        return float(np.mean(np.abs(diffs) >= np.abs(observed)))
+    return float(np.mean(diffs >= observed))
+
+
+# =========================
+# Dynetan computation
+# =========================
+def build_dnaproc() -> DNAproc:
+    dnap = DNAproc()
+    dnap.setNumWinds(NUM_WINDS)
+    dnap.setNumSampledFrames(NUM_FRAMES)
+    dnap.setCutoffDist(CUTOFF_DIST)
+    dnap.setContactPersistence(CONTACT_PERSISTENCE)
+    dnap.setSolvNames(SOLVENT_NAMES)
+    dnap.setSegIDs(SEGIDS)
+    dnap.setNodeGroups(USR_NODE_GROUPS)
+    dnap.setDistanceMode(mode="all")
+    return dnap
+
+
+def resid_to_index_from_nodes(dnap: DNAproc) -> Dict[int, int]:
+    """
+    Map resid -> index in correlation matrix.
+
+    Assumes one Dynetan node per residue.
+    Fails loudly if duplicate residue IDs are present in the node selection.
+    """
+    resid_to_idx: Dict[int, int] = {}
+    for idx, atom in enumerate(dnap.nodesAtmSel.atoms):
+        resid = int(atom.resid)
+        if resid in resid_to_idx:
+            raise ValueError(
+                f"Duplicate resid detected in nodesAtmSel (resid={resid}). "
+                "If residues repeat across segments, change mapping to (segid,resid)."
+            )
+        resid_to_idx[resid] = idx
+    return resid_to_idx
+
+
+def compute_per_window_sums(psf_file: Path, dcd_file: Path, residue_pairs: Sequence[Tuple[int, int]]) -> List[float]:
+    """
+    For each Dynetan window, sum correlation values for the defined residue_pairs.
+    Returns list length NUM_WINDS.
+    """
+    dnap = build_dnaproc()
+
+    dnap.loadSystem(str(psf_file), [str(dcd_file)])
+    dnap.getU().transfer_to_memory(verbose=False, step=TRANSFER_STEP)
+
+    dnap.checkSystem()
+    dnap.selectSystem(withSolvent=False)
+    dnap.prepareNetwork()
+    dnap.alignTraj(inMemory=True)
+
+    dnap.findContacts(stride=STRIDE)
+    dnap.filterContacts(notSameRes=True, notConsecutiveRes=False, removeIsolatedNodes=True)
+
+    dnap.calcCor(ncores=NCORES)
+
+    resid_to_idx = resid_to_index_from_nodes(dnap)
+    corr_matrices = dnap.corrMatAll
+
+    per_window_sums: List[float] = []
+    for mat in corr_matrices:
+        vals = []
+        for r1, r2 in residue_pairs:
+            if r1 in resid_to_idx and r2 in resid_to_idx:
+                i, j = resid_to_idx[r1], resid_to_idx[r2]
+                v = mat[i, j]
+                if not np.isnan(v):
+                    vals.append(v)
+        per_window_sums.append(float(np.sum(vals)))
+
+    return per_window_sums
+
+
+# =========================
+# Main workflow
+# =========================
+def run_all_variants(variants: List[Variant]) -> pd.DataFrame:
+    """
+    Returns a DataFrame indexed by variant.key with:
+      Label, Condition, Mutant, Window1..WindowN
+    """
+    rows = []
+    for v in variants:
+        print(f"Processing: {v.label}")
+        if (not v.psf.exists()) or (not v.dcd.exists()):
+            print(f"  SKIP missing files: {v.psf} / {v.dcd}")
+            continue
+
+        sums = compute_per_window_sums(v.psf, v.dcd, RESIDUE_PAIRS)
+        print(f"  window sums: {sums}")
+
+        row = {"Key": v.key, "Label": v.label, "Condition": v.condition, "Mutant": v.mutant}
+        for i, val in enumerate(sums, start=1):
+            row[f"Window{i}"] = val
+        rows.append(row)
+
+    if not rows:
+        raise RuntimeError("No variants processed. Check filenames/paths.")
+
+    df = pd.DataFrame(rows).set_index("Key")
+    return df
+
+
+def plot_grouped(df: pd.DataFrame, reference_key: str = "LIG_WT", out_png: str = "violet_normalized_allo_to_lip.png") -> None:
+    """
+    Plot mean±SD per variant, normalized to reference_key mean.
+    Grouped by mutant number; shows ligand vs apo side-by-side.
+    """
+    if reference_key not in df.index:
+        raise ValueError(f"Reference key '{reference_key}' not found in DataFrame index.")
+
+    value_cols = [c for c in df.columns if c.startswith("Window")]
+    df_vals = df[value_cols].copy()
+
+    ref_mean = df_vals.loc[reference_key].mean()
+    df_norm = df_vals.div(ref_mean)
+
+    mean_vals = df_norm.mean(axis=1)
+    std_vals = df_norm.std(axis=1)
+
+    # Build plotting order: for each mutant, plot ligand then apo
+    mutants = ["WT", "51", "152", "170", "209"]
+    key_map = {(df.loc[k, "Condition"], df.loc[k, "Mutant"]): k for k in df.index}
+
+    plot_order = []
+    for m in mutants:
+        if ("ligand", m) in key_map:
+            plot_order.append(key_map[("ligand", m)])
+        if ("apo", m) in key_map:
+            plot_order.append(key_map[("apo", m)])
+
+    # Positions: (ligand, apo) for each mutant
+    x_positions = []
+    x0 = 0.0
+    for _ in mutants:
+        x_positions.extend([x0, x0 + 0.5])
+        x0 += 2.0
+
+    # Styling
+    filled = {k for k in plot_order if df.loc[k, "Condition"] == "apo"}
+    open_ = {k for k in plot_order if df.loc[k, "Condition"] == "ligand"}
+
+    color_map = {"WT": "black", "51": "magenta", "152": "blue", "170": "red", "209": "orange"}
+
+    plt.figure(figsize=(6, 6))
+
+    for key, x in zip(plot_order, x_positions):
+        m = mean_vals[key]
+        s = std_vals[key]
+        mutant = str(df.loc[key, "Mutant"])
+        color = color_map.get(mutant, "gray")
+
+        if key in filled:
+            plt.plot(x, m, "o", color=color)
+            plt.plot([x, x], [m - s, m + s], color=color, linewidth=1.5)
+        elif key in open_:
+            plt.plot(x, m, "o", markerfacecolor="white", markeredgecolor=color)
+            plt.plot([x, x], [m - s, m + s], color=color, linestyle="--", linewidth=1.5)
+
+    plt.axhline(1.0, linestyle="--", color="gray", linewidth=1)
+
+    tick_pos = [(a + b) / 2 for a, b in zip(x_positions[::2], x_positions[1::2])]
+    plt.xticks(ticks=tick_pos, labels=mutants)
+
+    plt.ylabel(f"Normalized Correlation Sum ({df.loc[reference_key, 'Label']} = 1.0)")
+    plt.ylim(0.6, 1.6)
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=600)
+    plt.show()
+
+
+def stats_vs_reference(df: pd.DataFrame, reference_key: str = "LIG_WT") -> None:
+    """
+    Welch t-test + permutation p-values vs reference, using per-window values.
+    """
+    if reference_key not in df.index:
+        raise ValueError(f"Reference key '{reference_key}' not found.")
+
+    value_cols = [c for c in df.columns if c.startswith("Window")]
+    df_vals = df[value_cols]
+
+    ref = df_vals.loc[reference_key].values.astype(float)
+
+    print(f"\n### P-values vs reference: {df.loc[reference_key, 'Label']}\n")
+    for key in df_vals.index:
+        if key == reference_key:
+            continue
+        vals = df_vals.loc[key].values.astype(float)
+
+        _, p_welch = ttest_ind(ref, vals, equal_var=False)
+        p_perm = permutation_pval_diff_means(ref, vals, n_iterations=10_000, seed=42)
+
+        print(f"{df.loc[reference_key, 'Label']} vs {df.loc[key, 'Label']}: Welch p={p_welch:.6g}, Permutation p={p_perm:.6g}")
+
+
+def main() -> None:
+    # 1) Compute
+    df = run_all_variants(VARIANTS)
+
+    # 2) Save CSV
+    out_csv = "allo_to_lip_violet_path.csv"
+    df.to_csv(out_csv)
+    print(f"\nSaved CSV: {out_csv}")
+
+    # 3) Plot normalized to ligand WT
+    plot_grouped(df, reference_key="LIG_WT", out_png="violet_normalized_allo_to_lip.png")
+
+    # 4) Stats vs ligand WT
+    stats_vs_reference(df, reference_key="LIG_WT")
+
+
+if __name__ == "__main__":
+    main()
